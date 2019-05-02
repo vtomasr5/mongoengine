@@ -62,6 +62,8 @@ class StringField(BaseField):
 
     def from_python(self, value):
         if isinstance(value, str):
+            if PY3:
+                return value
             return value.decode('utf8')
         else:
             return super(StringField, self).from_python(value)
