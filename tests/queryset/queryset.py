@@ -624,7 +624,6 @@ class QuerySetTest(unittest.TestCase):
     def test_bulk_insert(self):
         """Ensure that bulk insert works
         """
-
         class Comment(EmbeddedDocument):
             name = StringField()
 
@@ -641,35 +640,31 @@ class QuerySetTest(unittest.TestCase):
         # Recreates the collection
         self.assertEqual(0, Blog.objects.count())
 
+        comment1 = Comment(name='testa')
+        comment2 = Comment(name='testb')
+        post1 = Post(comments=[comment1, comment2])
+        post2 = Post(comments=[comment2, comment2])
+
+        # Check bulk insert using load_bulk=False
+        blogs = [Blog(title="%s" % i, posts=[post1, post2])
+                 for i in range(99)]
         with query_counter() as q:
             self.assertEqual(q, 0)
-
-            comment1 = Comment(name='testa')
-            comment2 = Comment(name='testb')
-            post1 = Post(comments=[comment1, comment2])
-            post2 = Post(comments=[comment2, comment2])
-
-            blogs = []
-            for i in xrange(1, 100):
-                blogs.append(Blog(title="post %s" % i, posts=[post1, post2]))
-
             Blog.objects.insert(blogs, load_bulk=False)
-            if (get_connection().max_wire_version <= 1):
-                self.assertEqual(q, 1)
-            else:
-                self.assertEqual(q, 99)  # profiling logs each doc now in the bulk op
+            self.assertEqual(q, 1)  # 1 entry containing the list of inserts
+
+        self.assertEqual(Blog.objects.count(), len(blogs))
 
         Blog.drop_collection()
         Blog.ensure_indexes()
 
+        # Check bulk insert using load_bulk=True
+        blogs = [Blog(title="%s" % i, posts=[post1, post2])
+                 for i in range(99)]
         with query_counter() as q:
             self.assertEqual(q, 0)
-
             Blog.objects.insert(blogs)
-            if (get_connection().max_wire_version <= 1):
-                self.assertEqual(q, 2) # 1 for insert, and 1 for in bulk fetch
-            else:
-                self.assertEqual(q, 100)  # 99 for insert, and 1 for in bulk fetch
+            self.assertEqual(q, 2)  # 1 for insert 1 for fetch
 
         Blog.drop_collection()
 
@@ -685,60 +680,45 @@ class QuerySetTest(unittest.TestCase):
 
         self.assertEqual(Blog.objects.count(), 2)
 
-        # test handles people trying to upsert
-        def throw_operation_error():
-            blogs = Blog.objects
-            Blog.objects.insert(blogs)
+        # test inserting an existing document (shouldn't be allowed)
+        with self.assertRaises(OperationError) as cm:
+            blog = Blog.objects.first()
+            Blog.objects.insert(blog)
+        self.assertEqual(str(cm.exception), 'Some documents have ObjectIds use doc.update() instead')
 
-        self.assertRaises(OperationError, throw_operation_error)
+        # test inserting a query set
+        with self.assertRaises(OperationError) as cm:
+            blogs_qs = Blog.objects
+            Blog.objects.insert(blogs_qs)
+        self.assertEqual(str(cm.exception), 'Some documents have ObjectIds use doc.update() instead')
 
-        # Test can insert new doc
+        # insert 1 new doc
         new_post = Blog(title="code123", id=ObjectId())
         Blog.objects.insert(new_post)
 
-        # test handles other classes being inserted
-        def throw_operation_error_wrong_doc():
-            class Author(Document):
-                pass
-            Blog.objects.insert(Author())
-
-        self.assertRaises(OperationError, throw_operation_error_wrong_doc)
-
-        def throw_operation_error_not_a_document():
-            Blog.objects.insert("HELLO WORLD")
-
-        self.assertRaises(OperationError, throw_operation_error_not_a_document)
-
         Blog.drop_collection()
-        Blog.ensure_indexes()
+
         blog1 = Blog(title="code", posts=[post1, post2])
         blog1 = Blog.objects.insert(blog1)
         self.assertEqual(blog1.title, "code")
         self.assertEqual(Blog.objects.count(), 1)
 
         Blog.drop_collection()
-        Blog.ensure_indexes()
         blog1 = Blog(title="code", posts=[post1, post2])
         obj_id = Blog.objects.insert(blog1, load_bulk=False)
-        self.assertEqual(obj_id.__class__.__name__, 'ObjectId')
+        self.assertIsInstance(obj_id, ObjectId)
 
         Blog.drop_collection()
         Blog.ensure_indexes()
         post3 = Post(comments=[comment1, comment1])
         blog1 = Blog(title="foo", posts=[post1, post2])
         blog2 = Blog(title="bar", posts=[post2, post3])
-        blog3 = Blog(title="baz", posts=[post1, post2])
         Blog.objects.insert([blog1, blog2])
 
-        def throw_operation_error_not_unique():
-            Blog.objects.insert([blog2, blog3])
+        with self.assertRaises(NotUniqueError):
+            Blog.objects.insert(Blog(title=blog2.title))
 
-        self.assertRaises(NotUniqueError, throw_operation_error_not_unique)
         self.assertEqual(Blog.objects.count(), 2)
-
-        Blog.objects.insert([blog2, blog3], write_concern={"w": 0,
-                            'continue_on_error': True})
-        self.assertEqual(Blog.objects.count(), 3)
 
     def test_get_changed_fields_query_count(self):
 
@@ -799,43 +779,17 @@ class QuerySetTest(unittest.TestCase):
 
             self.assertEqual(q, 2)
 
-    def test_slave_okay(self):
-        """Ensures that a query can take slave_okay syntax
-        """
-        person1 = self.Person(name="User A", age=20)
-        person1.save()
-        person2 = self.Person(name="User B", age=30)
-        person2.save()
-
-        # Retrieve the first person from the database
-        person = self.Person.objects.slave_okay(True).first()
-        self.assertTrue(isinstance(person, self.Person))
-        self.assertEqual(person.name, "User A")
-        self.assertEqual(person.age, 20)
-
-    def test_cursor_args(self):
+    def test_timeout_and_cursor_args(self):
         """Ensures the cursor args can be set as expected
         """
         p = self.Person.objects
-        # Check default
-        self.assertEqual(p._cursor_args,
-                {'snapshot': False, 'slave_okay': False, 'timeout': True})
+        self.assertEqual(p._cursor_args, {'no_cursor_timeout': False})
 
-        p = p.snapshot(False).slave_okay(False).timeout(False)
-        self.assertEqual(p._cursor_args,
-                {'snapshot': False, 'slave_okay': False, 'timeout': False})
+        p = p.timeout(False)
+        self.assertEqual(p._cursor_args, {'no_cursor_timeout': True})
 
-        p = p.snapshot(True).slave_okay(False).timeout(False)
-        self.assertEqual(p._cursor_args,
-                {'snapshot': True, 'slave_okay': False, 'timeout': False})
-
-        p = p.snapshot(True).slave_okay(True).timeout(False)
-        self.assertEqual(p._cursor_args,
-                {'snapshot': True, 'slave_okay': True, 'timeout': False})
-
-        p = p.snapshot(True).slave_okay(True).timeout(True)
-        self.assertEqual(p._cursor_args,
-                         {'snapshot': True, 'slave_okay': True, 'timeout': True})
+        p = p.timeout(True)
+        self.assertEqual(p._cursor_args, {'no_cursor_timeout': False})
 
     def test_repeated_iteration(self):
         """Ensure that QuerySet rewinds itself one iteration finishes.
@@ -2183,33 +2137,78 @@ class QuerySetTest(unittest.TestCase):
         freqs = Test.objects.item_frequencies('val', map_reduce=True, normalize=True)
         self.assertEqual(freqs, {1: 50.0/70, 2: 20.0/70})
 
+
     def test_average(self):
-        """Ensure that field can be averaged correctly.
-        """
+        """Ensure that field can be averaged correctly."""
+        ages = [0, 23, 54, 12, 94, 27]
+        for i, age in enumerate(ages):
+            self.Person(name='test%s' % i, age=age).save()
+        self.Person(name='ageless person').save()
+
+        avg = float(sum(ages)) / (len(ages))
+        self.assertAlmostEqual(int(self.Person.objects.average('age')), avg)
+
+    def test_aggregate_average(self):
+        ages = [0, 23, 54, 12, 94, 27]
+        for i, age in enumerate(ages):
+            self.Person(name='test%s' % i, age=age).save()
+        self.Person(name='ageless person').save()
+
+        avg = float(sum(ages)) / (len(ages))
+        self.assertAlmostEqual(
+            int(self.Person.objects.aggregate_average('age')), avg
+        )
+
+    def test_average_over_zero(self):
         self.Person(name='person', age=0).save()
         self.assertEqual(int(self.Person.objects.average('age')), 0)
 
-        ages = [23, 54, 12, 94, 27]
-        for i, age in enumerate(ages):
-            self.Person(name='test%s' % i, age=age).save()
-
-        avg = float(sum(ages)) / (len(ages) + 1) # take into account the 0
-        self.assertAlmostEqual(int(self.Person.objects.average('age')), avg)
-
-        self.Person(name='ageless person').save()
-        self.assertEqual(int(self.Person.objects.average('age')), avg)
+    def test_aggregate_average_over_zero(self):
+        self.Person(name='person', age=0).save()
+        self.assertEqual(int(self.Person.objects.aggregate_average('age')), 0)
 
     def test_sum(self):
-        """Ensure that field can be summed over correctly.
-        """
-        ages = [23, 54, 12, 94, 27]
+        """Ensure that field can be summed over correctly."""
+        ages = [0, 23, 54, 12, 94, 27]
         for i, age in enumerate(ages):
             self.Person(name='test%s' % i, age=age).save()
-
-        self.assertEqual(int(self.Person.objects.sum('age')), sum(ages))
-
         self.Person(name='ageless person').save()
+
         self.assertEqual(int(self.Person.objects.sum('age')), sum(ages))
+
+    def test_aggregate_sum(self):
+        ages = [0, 23, 54, 12, 94, 27]
+        for i, age in enumerate(ages):
+            self.Person(name='test%s' % i, age=age).save()
+        self.Person(name='ageless person').save()
+
+        self.assertEqual(
+            int(self.Person.objects.aggregate_sum('age')), sum(ages)
+        )
+
+    def test_aggregate_average_over_db_field(self):
+        class UserVisit(Document):
+            num_visits = IntField(db_field='visits')
+
+        UserVisit.drop_collection()
+
+        UserVisit.objects.create(num_visits=20)
+        UserVisit.objects.create(num_visits=10)
+
+        self.assertEqual(
+            UserVisit.objects.aggregate_average('num_visits'), 15
+        )
+
+    def test_aggregate_sum_over_db_field(self):
+        class UserVisit(Document):
+            num_visits = IntField(db_field='visits')
+
+        UserVisit.drop_collection()
+
+        UserVisit.objects.create(num_visits=10)
+        UserVisit.objects.create(num_visits=5)
+
+        self.assertEqual(UserVisit.objects.aggregate_sum('num_visits'), 15)
 
     def test_distinct(self):
         """Ensure that the QuerySet.distinct method works.
@@ -2766,7 +2765,7 @@ class QuerySetTest(unittest.TestCase):
             fielda = IntField()
             fieldb = IntField()
 
-        IntPair.objects._collection.remove()
+        IntPair.objects._collection.delete_many({})
 
         a = IntPair(fielda=1, fieldb=1)
         b = IntPair(fielda=1, fieldb=2)
@@ -3132,8 +3131,7 @@ class QuerySetTest(unittest.TestCase):
         bars = list(Bar.objects(read_preference=ReadPreference.PRIMARY))
         self.assertEqual([], bars)
 
-        self.assertRaises(ConfigurationError, Bar.objects,
-                          read_preference='Primary')
+        self.assertRaises(TypeError, Bar.objects, read_preference='Primary')
 
         # read_preference as a kwarg
         bars = Bar.objects(read_preference=ReadPreference.SECONDARY_PREFERRED)

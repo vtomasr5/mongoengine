@@ -10,10 +10,12 @@ import warnings
 from bson.code import Code
 from bson import json_util
 import pymongo
+from pymongo.collection import ReturnDocument
 from pymongo.common import validate_read_preference
 
 from mongoengine import signals
 from mongoengine.common import _import_class
+from mongoengine.context_managers import set_write_concern
 from mongoengine.errors import (OperationError, NotUniqueError,
                                 InvalidQueryError)
 
@@ -54,10 +56,8 @@ class QuerySet(object):
         self._where_clause = None
         self._loaded_fields = QueryFieldList()
         self._ordering = None
-        self._snapshot = False
         self._timeout = True
         self._class_check = True
-        self._slave_okay = False
         self._read_preference = None
         self._iter = False
         self._scalar = []
@@ -93,10 +93,10 @@ class QuerySet(object):
             objects, only the last one will be used
         :param class_check: If set to False bypass class name check when
             querying collection
-        :param slave_okay: if True, allows this query to be run against a
-            replica secondary.
-        :params read_preference: if set, overrides connection-level
-            read_preference from `ReplicaSetConnection`.
+        :params slave_okay: a deprecated no-op, not removed at the moment
+            as to not break the signature of this method.
+        :params read_preference: if set, overrides the connection-level
+            read preference.
         :param query: Django-style query keyword arguments
         """
         query = Q(**query)
@@ -328,19 +328,16 @@ class QuerySet(object):
             result = None
         return result
 
-    def insert(self, doc_or_docs, load_bulk=True, write_concern=None):
+    def insert(self, doc_or_docs, load_bulk=True, write_concern=None,
+               signal_kwargs=None):
         """bulk insert documents
 
         :param docs_or_doc: a document or list of documents to be inserted
         :param load_bulk (optional): If True returns the list of document
-            instances
-        :param write_concern: Extra keyword arguments are passed down to
-                :meth:`~pymongo.collection.Collection.insert`
-                which will be used as options for the resultant
-                ``getLastError`` command.  For example,
-                ``insert(..., {w: 2, fsync: True})`` will wait until at least
-                two servers have recorded the write and will force an fsync on
-                each server being written to.
+            instances.
+        :param write_concern: Write concern of this operation.
+        :parm signal_kwargs: (optional) kwargs dictionary to be passed to
+            the signal calls.
 
         By default returns document instances, set ``load_bulk`` to False to
         return just ``ObjectIds``
@@ -358,24 +355,39 @@ class QuerySet(object):
             return_one = True
             docs = [docs]
 
-        raw = []
         for doc in docs:
             if not isinstance(doc, self._document):
                 msg = ("Some documents inserted aren't instances of %s"
                        % str(self._document))
                 raise OperationError(msg)
             if doc.pk and doc._created:
-                msg = "Some documents have ObjectIds use doc.update() instead"
+                msg = 'Some documents have ObjectIds use doc.update() instead'
                 raise OperationError(msg)
-            raw.append(doc.to_mongo())
 
-        signals.pre_bulk_insert.send(self._document, documents=docs)
+        signal_kwargs = signal_kwargs or {}
+        signals.pre_bulk_insert.send(self._document,
+                                     documents=docs, **signal_kwargs)
+
+        raw = [doc.to_mongo() for doc in docs]
+
+        with set_write_concern(self._collection, write_concern) as collection:
+            insert_func = collection.insert_many
+            if return_one:
+                raw = raw[0]
+                insert_func = collection.insert_one
+
         try:
-            ids = self._collection.insert(raw, **write_concern)
-        except pymongo.errors.DuplicateKeyError, err:
+            inserted_result = insert_func(raw)
+            ids = [inserted_result.inserted_id] if return_one else inserted_result.inserted_ids
+        except pymongo.errors.DuplicateKeyError as err:
             message = 'Could not save document (%s)'
             raise NotUniqueError(message % unicode(err))
-        except pymongo.errors.OperationFailure, err:
+        except pymongo.errors.BulkWriteError as err:
+            # inserting documents that already have an _id field will
+            # give huge performance debt or raise
+            message = u'Document must not have _id value before bulk write (%s)'
+            raise NotUniqueError(message % unicode(err))
+        except pymongo.errors.OperationFailure as err:
             message = 'Could not save document (%s)'
             if re.match('^E1100[01] duplicate key', unicode(err)):
                 # E11000 - duplicate key error index
@@ -384,18 +396,20 @@ class QuerySet(object):
                 raise NotUniqueError(message % unicode(err))
             raise OperationError(message % unicode(err))
 
+        # Apply inserted_ids to documents
+        for doc, doc_id in zip(docs, ids):
+            doc.pk = doc_id
+
         if not load_bulk:
             signals.post_bulk_insert.send(
                 self._document, documents=docs, loaded=False)
             return return_one and ids[0] or ids
 
         documents = self.in_bulk(ids)
-        results = []
-        for obj_id in ids:
-            results.append(documents.get(obj_id))
+        results = [documents.get(obj_id) for obj_id in ids]
         signals.post_bulk_insert.send(
-            self._document, documents=results, loaded=True)
-        return return_one and results[0] or results
+            self._document, documents=results, loaded=True, **signal_kwargs)
+        return results[0] if return_one else results
 
     def count(self, with_limit_and_skip=True):
         """Count the selected elements in the query.
@@ -420,12 +434,7 @@ class QuerySet(object):
     def delete(self, write_concern=None, _from_doc_delete=False):
         """Delete the documents matched by the query.
 
-        :param write_concern: Extra keyword arguments are passed down which
-            will be used as options for the resultant
-            ``getLastError`` command.  For example,
-            ``save(..., write_concern={w: 2, fsync: True}, ...)`` will
-            wait until at least two servers have recorded the write and
-            will force an fsync on the primary server.
+        :param write_concern: Write concern of this operation.
         :param _from_doc_delete: True when called from document delete therefore
             signals will have been triggered so don't loop.
         """
@@ -478,19 +487,15 @@ class QuerySet(object):
                     write_concern=write_concern,
                     **{'pull_all__%s' % field_name: self})
 
-        queryset._collection.remove(queryset._query, write_concern=write_concern)
+        with set_write_concern(queryset._collection, write_concern) as coll:
+            coll.delete_many(queryset._query)
 
     def update(self, upsert=False, multi=True, write_concern=None, **update):
         """Perform an atomic update on the fields matched by the query.
 
         :param upsert: Any existing document with that "_id" is overwritten.
         :param multi: Update multiple documents.
-        :param write_concern: Extra keyword arguments are passed down which
-            will be used as options for the resultant
-            ``getLastError`` command.  For example,
-            ``save(..., write_concern={w: 2, fsync: True}, ...)`` will
-            wait until at least two servers have recorded the write and
-            will force an fsync on the primary server.
+        :param write_concern: Write concern of this operation.
         :param update: Django-style update keyword arguments
 
         .. versionadded:: 0.2
@@ -512,12 +517,14 @@ class QuerySet(object):
                 update["$set"]["_cls"] = queryset._document._class_name
             else:
                 update["$set"] = {"_cls": queryset._document._class_name}
-
         try:
-            ret = queryset._collection.update(query, update, multi=multi,
-                                              upsert=upsert, **write_concern)
-            if ret is not None and 'n' in ret:
-                return ret['n']
+            with set_write_concern(queryset._collection, write_concern) as collection:
+                update_func = collection.update_one
+                if multi:
+                    update_func = collection.update_many
+                result = update_func(query, update, upsert=upsert)
+            if result.raw_result:
+                return result.raw_result['n']
         except pymongo.errors.DuplicateKeyError, err:
             raise NotUniqueError(u'Update failed (%s)' % unicode(err))
         except pymongo.errors.OperationFailure, err:
@@ -541,7 +548,11 @@ class QuerySet(object):
         .. versionadded:: 0.2
         """
         return self.update(
-            upsert=upsert, multi=False, write_concern=write_concern, **update)
+            upsert=upsert,
+            multi=False,
+            write_concern=write_concern,
+            **update
+        )
 
     def modify(self, upsert=False, full_response=False, remove=False, new=False, **update):
         """Update and return the updated document.
@@ -576,17 +587,29 @@ class QuerySet(object):
 
         queryset = self.clone()
         query = queryset._query
-        update = transform.update(queryset._document, **update)
+        if not remove:
+            update = transform.update(queryset._document, **update)
         sort = queryset._ordering
 
         try:
-            result = queryset._collection.find_and_modify(
-                query, update, upsert=upsert, sort=sort, remove=remove, new=new,
-                full_response=full_response, **self._cursor_args)
-        except pymongo.errors.DuplicateKeyError, err:
-            raise NotUniqueError(u"Update failed (%s)" % err)
-        except pymongo.errors.OperationFailure, err:
-            raise OperationError(u"Update failed (%s)" % err)
+            if full_response:
+                msg = 'With PyMongo 3+, it is not possible anymore to get the full response.'
+                warnings.warn(msg, DeprecationWarning)
+            if remove:
+                result = queryset._collection.find_one_and_delete(
+                    query, sort=sort, **self._cursor_args)
+            else:
+                if new:
+                    return_doc = ReturnDocument.AFTER
+                else:
+                    return_doc = ReturnDocument.BEFORE
+                result = queryset._collection.find_one_and_update(
+                    query, update, upsert=upsert, sort=sort, return_document=return_doc,
+                    **self._cursor_args)
+        except pymongo.errors.DuplicateKeyError as err:
+            raise NotUniqueError(u'Update failed (%s)' % err)
+        except pymongo.errors.OperationFailure as err:
+            raise OperationError(u'Update failed (%s)' % err)
 
         if full_response:
             if result["value"] is not None:
@@ -689,11 +712,13 @@ class QuerySet(object):
         """
         c = self.__class__(self._document, self._collection_obj)
 
-        copy_props = ('_mongo_query', '_initial_query', '_none', '_query_obj',
-                      '_where_clause', '_loaded_fields', '_ordering', '_snapshot',
-                      '_timeout', '_class_check', '_slave_okay', '_read_preference',
-                      '_iter', '_scalar', '_as_pymongo', '_as_pymongo_coerce',
-                      '_limit', '_skip', '_hint', '_batch_size', '_auto_dereference')
+        copy_props = (
+            '_mongo_query', '_initial_query', '_none', '_query_obj',
+            '_where_clause', '_loaded_fields', '_ordering', '_timeout',
+            '_class_check', '_read_preference', '_iter', '_scalar',
+            '_as_pymongo', '_as_pymongo_coerce', '_limit', '_skip', '_hint',
+            '_batch_size', '_auto_dereference'
+        )
 
         for prop in copy_props:
             val = getattr(self, prop)
@@ -914,17 +939,6 @@ class QuerySet(object):
             plan = pprint.pformat(plan)
         return plan
 
-    def snapshot(self, enabled):
-        """Enable or disable snapshot mode when querying.
-
-        :param enabled: whether or not snapshot mode is enabled
-
-        ..versionchanged:: 0.5 - made chainable
-        """
-        queryset = self.clone()
-        queryset._snapshot = enabled
-        return queryset
-
     def timeout(self, enabled):
         """Enable or disable the default mongod timeout when querying.
 
@@ -936,20 +950,11 @@ class QuerySet(object):
         queryset._timeout = enabled
         return queryset
 
-    def slave_okay(self, enabled):
-        """Enable or disable the slave_okay when querying.
-
-        :param enabled: whether or not the slave_okay is enabled
-        """
-        queryset = self.clone()
-        queryset._slave_okay = enabled
-        return queryset
-
     def read_preference(self, read_preference):
         """Change the read_preference when querying.
 
-        :param read_preference: override ReplicaSetConnection-level
-            preference.
+        :param read_preference: read preference to use instead of the
+            connection-level preference.
         """
         validate_read_preference('read_preference', read_preference)
         queryset = self.clone()
@@ -1195,12 +1200,19 @@ class QuerySet(object):
             return 0
 
     def aggregate_sum(self, field):
-        result = self._document._get_collection().aggregate([
-            { '$match': self._query },
-            { '$group': { '_id': 'sum', 'total': { '$sum': '$' + field } } }
-        ])
-        if result['result']:
-            return result['result'][0]['total']
+        """Sum over the values of the specified field.
+
+        :param field: the field to sum over; use dot notation to refer to
+            embedded document fields
+        """
+        db_field = self._fields_to_dbfields([field]).pop()
+        pipeline = [
+            {'$match': self._query},
+            {'$group': {'_id': 'sum', 'total': {'$sum': '$' + db_field}}}
+        ]
+        result = tuple(self._document._get_collection().aggregate(pipeline))
+        if result:
+            return result[0]['total']
         return 0
 
     def average(self, field):
@@ -1244,12 +1256,14 @@ class QuerySet(object):
             return 0
 
     def aggregate_average(self, field):
-        result = self._document._get_collection().aggregate([
-            { '$match': self._query },
-            { '$group': { '_id': 'avg', 'total': { '$avg': '$' + field } } }
-        ])
-        if result['result']:
-            return result['result'][0]['total']
+        db_field = self._fields_to_dbfields([field]).pop()
+        pipeline = [
+            {'$match': self._query},
+            {'$group': {'_id': 'avg', 'total': {'$avg': '$' + db_field}}}
+        ]
+        result = tuple(self._document._get_collection().aggregate(pipeline))
+        if result:
+            return result[0]['total']
         return 0
 
     def item_frequencies(self, field, normalize=False, map_reduce=True):
@@ -1317,24 +1331,32 @@ class QuerySet(object):
     @property
     def _cursor_args(self):
         cursor_args = {
-            'snapshot': self._snapshot,
-            'timeout': self._timeout
+            'no_cursor_timeout': not self._timeout,
         }
-        if self._read_preference is not None:
-            cursor_args['read_preference'] = self._read_preference
-        else:
-            cursor_args['slave_okay'] = self._slave_okay
         if self._loaded_fields:
-            cursor_args['fields'] = self._loaded_fields.as_dict()
+            cursor_args['projection'] = self._loaded_fields.as_dict()
         return cursor_args
 
     @property
     def _cursor(self):
         if self._cursor_obj is None:
 
-            self._cursor_obj = self._collection.find(self._query,
-                                                     **self._cursor_args)
-            # Apply where clauses to cursor
+            # Create a new PyMongo cursor.
+            # XXX In PyMongo 3+, we define the read preference on a collection
+            # level, not a cursor level. Thus, if read preference is defined,
+            # we need to get a cloned collection object using `with_options`
+            # first.
+            if self._read_preference is not None:
+                self._cursor_obj = (
+                    self._collection
+                        .with_options(read_preference=self._read_preference)
+                        .find(self._query, **self._cursor_args)
+                )
+            else:
+                self._cursor_obj = self._collection.find(self._query,
+                                                         **self._cursor_args)
+
+            # Apply "where" clauses to the cursor.
             if self._where_clause:
                 where_clause = self._sub_js_fields(self._where_clause)
                 self._cursor_obj.where(where_clause)
