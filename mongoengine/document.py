@@ -553,7 +553,7 @@ class Document(BaseDocument):
         index_spec['background'] = True  # all of the indexes are created in the background
         index_spec.update(kwargs)
 
-        return cls._get_collection().ensure_index(fields, **index_spec)
+        return cls._get_collection().create_index(fields, **index_spec)
 
     @classmethod
     def ensure_indexes(cls):
@@ -589,7 +589,7 @@ class Document(BaseDocument):
                 if 'cls' in opts:
                     del opts['cls']
 
-                collection.ensure_index(fields, **opts)
+                collection.create_index(fields, **opts)
 
         # If _cls is being used (for polymorphism), it needs an index,
         # only if another index doesn't begin with _cls
@@ -601,7 +601,7 @@ class Document(BaseDocument):
             if 'cls' in index_opts:
                 del index_opts['cls']
 
-            collection.ensure_index('_cls', **index_opts)
+            collection.create_index('_cls', **index_opts)
 
     @classmethod
     def list_indexes(cls):
