@@ -2,8 +2,15 @@ import pymongo
 from pymongo import (MongoClient, MongoReplicaSetClient, ReadPreference,
                      uri_parser)
 
-__all__ = ['ConnectionError', 'connect', 'register_connection',
-           'DEFAULT_CONNECTION_NAME']
+__all__ = [
+    'DEFAULT_CONNECTION_NAME',
+    'ConnectionError',
+    'connect',
+    'disconnect',
+    'get_connection',
+    'get_db',
+    'register_connection',
+]
 
 
 DEFAULT_CONNECTION_NAME = 'default'
