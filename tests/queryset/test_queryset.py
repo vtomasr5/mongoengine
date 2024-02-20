@@ -1,26 +1,25 @@
 import sys
+
 sys.path[0:0] = [""]
 
 import unittest
 import uuid
-from nose.plugins.skip import SkipTest
-
 from datetime import datetime, timedelta
 
 import pymongo
-from pymongo.errors import ConfigurationError
-from pymongo.read_preferences import ReadPreference
-
 from bson import ObjectId
+from nose.plugins.skip import SkipTest
+from pymongo.errors import ConfigurationError
+from pymongo.read_concern import ReadConcern
+from pymongo.read_preferences import ReadPreference
 
 from mongoengine import *
 from mongoengine.connection import get_connection
-from mongoengine.python_support import PY3
 from mongoengine.context_managers import query_counter
-from mongoengine.queryset import (QuerySet, QuerySetManager,
-                                  MultipleObjectsReturned, DoesNotExist,
-                                  queryset_manager)
 from mongoengine.errors import InvalidQueryError
+from mongoengine.python_support import PY3
+from mongoengine.queryset import (DoesNotExist, MultipleObjectsReturned,
+                                  QuerySet, QuerySetManager, queryset_manager)
 
 __all__ = ("QuerySetTest",)
 
@@ -1050,7 +1049,6 @@ class QuerySetTest(unittest.TestCase):
 
         BlogPost.drop_collection()
 
-
     def test_exec_js_query(self):
         """Ensure that queries are properly formed for use in exec_js.
         """
@@ -1447,7 +1445,6 @@ class QuerySetTest(unittest.TestCase):
         post.reload()
         self.assertEqual(post.tags, ["mongodb"])
 
-
         BlogPost.objects(slug="test").update(pull_all__tags=["mongodb", "code"])
         post.reload()
         self.assertEqual(post.tags, [])
@@ -1487,7 +1484,6 @@ class QuerySetTest(unittest.TestCase):
         class Site(Document):
             name = StringField(max_length=75, unique=True, required=True)
             collaborators = ListField(EmbeddedDocumentField(Collaborator))
-
 
         Site.drop_collection()
 
@@ -2020,7 +2016,6 @@ class QuerySetTest(unittest.TestCase):
         doc.phone = Phone(number='62-3332-1656')
         doc.save()
 
-
         def test_assertions(f):
             f = dict((key, int(val)) for key, val in list(f.items()))
             self.assertEqual(set(['62-3331-1656', '62-3332-1656']), set(f.keys()))
@@ -2068,7 +2063,6 @@ class QuerySetTest(unittest.TestCase):
         self.assertEqual(freq, {'CRB': 1.0, None: 1.0})
         freq = Person.objects.item_frequencies('city', normalize=True)
         self.assertEqual(freq, {'CRB': 0.5, None: 0.5})
-
 
         freq = Person.objects.item_frequencies('city', map_reduce=True)
         self.assertEqual(freq, {'CRB': 1.0, None: 1.0})
@@ -2148,7 +2142,6 @@ class QuerySetTest(unittest.TestCase):
 
         freqs = Test.objects.item_frequencies('val', map_reduce=True, normalize=True)
         self.assertEqual(freqs, {1: 50.0/70, 2: 20.0/70})
-
 
     def test_average(self):
         """Ensure that field can be averaged correctly."""
@@ -3186,6 +3179,53 @@ class QuerySetTest(unittest.TestCase):
             bars._cursor.collection.read_preference,
             ReadPreference.SECONDARY_PREFERRED
         )
+
+    def test_read_concern(self):
+        class Bar(Document):
+            txt = StringField()
+
+            meta = {"indexes": ["txt"]}
+
+        Bar.drop_collection()
+        bar = Bar.objects.create(txt="xyz")
+
+        bars = list(Bar.objects.read_concern(None))
+        assert bars == [bar]
+
+        bars = Bar.objects.read_concern(ReadConcern(level='local'))
+        assert bars._read_concern == ReadConcern(level='local')
+        assert (
+            bars._cursor.collection.read_concern
+            == ReadConcern(level='local')
+        )
+
+        # Make sure that `.read_concern(...)` does accept string values.
+        with self.assertRaises(TypeError):
+            Bar.objects.read_concern('local')
+
+        def assert_read_concern(qs, expected_read_concern):
+            assert qs._read_concern == expected_read_concern
+            assert qs._cursor.collection.read_concern == expected_read_concern
+
+        # Make sure read concern is respected after a `.skip(...)`.
+        bars = Bar.objects.skip(1).read_concern(ReadConcern('majority'))
+        assert_read_concern(bars, ReadConcern('majority'))
+
+        # Make sure read concern is respected after a `.limit(...)`.
+        bars = Bar.objects.limit(1).read_concern(ReadConcern('majority'))
+        assert_read_concern(bars, ReadConcern('majority'))
+
+        # Make sure read concern is respected after an `.order_by(...)`.
+        bars = Bar.objects.order_by("txt").read_concern(
+            ReadConcern('majority')
+        )
+        assert_read_concern(bars, ReadConcern('majority'))
+
+        # Make sure read concern is respected after a `.hint(...)`.
+        bars = Bar.objects.hint([("txt", 1)]).read_concern(
+            ReadConcern('majority')
+        )
+        assert_read_concern(bars, ReadConcern('majority'))
 
     def test_json_simple(self):
 
